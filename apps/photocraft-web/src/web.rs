@@ -1,6 +1,6 @@
 //! The browser shell: web `Services`, drag-and-drop, and the eframe web runner.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,7 @@ use photocraft_ui_egui::i18n;
 use photocraft_ui_egui::served_fonts;
 use photocraft_ui_egui::theme::ThemeKind;
 use photocraft_ui_egui::{FileDialogAnswer, FileDialogRequest, PhotocraftApp, Services};
-use wasm_bindgen::JsCast as _;
+use wasm_bindgen::{JsCast as _, JsValue, closure::Closure, prelude::wasm_bindgen};
 
 type Inbox = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 type PlaceInbox = photocraft_ui_egui::PlaceInbox;
@@ -46,6 +46,51 @@ struct ServedFonts {
 }
 
 type Served = Arc<Mutex<ServedFonts>>;
+
+thread_local! {
+    static EXPORT_RUNNER: RefCell<Option<eframe::WebRunner>> = const { RefCell::new(None) };
+}
+
+#[wasm_bindgen]
+pub async fn export_bytes(format: Option<String>) -> Result<js_sys::Uint8Array, JsValue> {
+    let format = format.as_deref().unwrap_or("pcraft").trim_start_matches('.').to_ascii_lowercase();
+    if !matches!(format.as_str(), "pcraft" | "png") {
+        return Err(js_sys::Error::new("Unsupported PhotoCraft export format (use pcraft or png).").into());
+    }
+
+    let doc = EXPORT_RUNNER.with_borrow(|runner| {
+        let app = runner.as_ref()?.app_mut::<WebShell>()?;
+        app.app.session.active().map(|state| Arc::clone(&state.doc))
+    });
+    let doc = doc.ok_or_else(|| js_sys::Error::new("No PhotoCraft document is open."))?;
+    let options = photocraft_io::ExportOptions {
+        preserve_alpha: true,
+        read_linked_files: false,
+        ..Default::default()
+    };
+    let exported = photocraft_io::export(&doc, &format, &options)
+        .map_err(|error| js_sys::Error::new(&format!("PhotoCraft export failed: {error}")))?;
+    Ok(js_sys::Uint8Array::from(exported.bytes.as_slice()))
+}
+
+fn install_export_bridge(runner: &eframe::WebRunner) -> Result<(), JsValue> {
+    let bridge = js_sys::Object::new();
+    let export = Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |format: JsValue| {
+        wasm_bindgen_futures::future_to_promise(async move {
+            let name = if format.is_undefined() {
+                None
+            } else {
+                Some(format.as_string().ok_or_else(|| js_sys::Error::new("PhotoCraft export format must be a string."))?)
+            };
+            export_bytes(name).await.map(JsValue::from)
+        })
+    });
+    js_sys::Reflect::set(&bridge, &"version".into(), &1.into())?;
+    js_sys::Reflect::set(&bridge, &"exportBytes".into(), &export.into_js_value())?;
+    js_sys::Reflect::set(&js_sys::global(), &"photocraftBridge".into(), &bridge)?;
+    EXPORT_RUNNER.with_borrow_mut(|state| *state = Some(runner.clone()));
+    Ok(())
+}
 
 pub fn start() {
     eframe::WebLogger::init(log::LevelFilter::Info).ok();
@@ -120,6 +165,11 @@ pub fn start() {
                 }),
             )
             .await;
+        if result.is_ok()
+            && let Err(error) = install_export_bridge(&runner)
+        {
+            log::error!("Could not install PhotoCraft export bridge: {error:?}");
+        }
         if let Some(el) = document.get_element_by_id("photocraft_loading") {
             match result {
                 Ok(()) => el.remove(),
@@ -414,6 +464,10 @@ impl WebShell {
 }
 
 impl eframe::App for WebShell {
+    fn as_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         // A tap reaches eframe as Pointer Events and Touch Events: keep one press per tap, or the
         // twin press closes the menu the first one opened (#2095).
